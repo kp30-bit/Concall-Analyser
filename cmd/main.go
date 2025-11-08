@@ -1,8 +1,11 @@
-package cmd
+package main
 
 import (
 	"concall-analyser/config"
+	"concall-analyser/internal/controller"
 	"concall-analyser/internal/db"
+	"concall-analyser/internal/interfaces"
+	"concall-analyser/internal/usecase"
 	"context"
 	"log"
 	"net/http"
@@ -26,8 +29,8 @@ var (
 
 // App struct
 type App struct {
-	Router *gin.Engine
-	// URLUsecase  interfaces.Usecase
+	Router      *gin.Engine
+	Usecase     interfaces.Usecase
 	MongoClient *db.MongoClient
 	Config      *config.Config
 }
@@ -53,27 +56,27 @@ func main() {
 func NewApp() *App {
 	cfg := GetConfig()
 
-	client, _ := GetMongo()
-	// urlUsecase := usecase.NewURLUsecase(db, cfg)
+	client, db := GetMongo()
+	usecase := usecase.NewUsecase(db, cfg)
 	router := gin.Default()
 
 	// Register routes
-	// controller.RegisterURLRoutes(router, urlUsecase)
+	controller.RegisterRoutes(router, usecase)
 
 	// Serve static frontend assets (JS, CSS)
-	router.Static("/static", "./frontend")
+	// router.Static("/static", "./frontend")
 
-	// Serve main HTML file
-	router.LoadHTMLFiles("frontend/index.html")
+	// // Serve main HTML file
+	// router.LoadHTMLFiles("frontend/index.html")
 
 	// Render frontend when visiting root
-	router.GET("/", func(c *gin.Context) {
-		c.HTML(http.StatusOK, "index.html", nil)
-	})
+	// router.GET("/", func(c *gin.Context) {
+	// 	c.HTML(http.StatusOK, "index.html", nil)
+	// })
 
 	return &App{
-		Router: router,
-		// URLUsecase:  urlUsecase,
+		Router:      router,
+		Usecase:     usecase,
 		MongoClient: client,
 		Config:      cfg,
 	}
