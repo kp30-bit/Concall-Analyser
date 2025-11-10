@@ -16,6 +16,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,6 +26,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
@@ -306,7 +309,7 @@ func processAnnouncementsSequentially(
 		}
 
 		// Only add to results if summary is valid (not nil)
-		if summary != nil {
+		if summary != nil && summary.Guidance != "NA" {
 			results = append(results, *summary)
 			log.Printf("✅ Processed successfully: %s", a.ShortLongName)
 		} else {
@@ -657,9 +660,176 @@ func fetchAnnouncements(client *HTTPClient, c *gin.Context) ([]Announcement, err
 }
 
 // Helper function for min (if not using Go 1.21+)
-func min(a, b int) int {
-	if a < b {
-		return a
+
+type ConcallLite struct {
+	Name     string `bson:"name" json:"name"`
+	Date     string `bson:"date" json:"date"`
+	Guidance string `bson:"guidance" json:"guidance"`
+}
+
+func (cf *concallFetcher) ListConcallHandler(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	pageStr := c.DefaultQuery("page", "1")
+	limitStr := c.DefaultQuery("limit", "10")
+
+	page, err := strconv.Atoi(pageStr)
+	if err != nil || page <= 0 {
+		page = 1
 	}
-	return b
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil || limit <= 0 {
+		limit = 10
+	}
+
+	skip := int64((page - 1) * limit)
+	limit64 := int64(limit)
+
+	coll := cf.db.Collection("guidances")
+
+	// We only need name, date, guidance
+	projection := bson.M{
+		"name":     1,
+		"date":     1,
+		"guidance": 1,
+		"_id":      0, // don't return _id if not needed
+	}
+
+	findOpts := options.Find().
+		SetProjection(projection).
+		SetSort(bson.D{{Key: "date", Value: -1}}). // newest first
+		SetSkip(skip).
+		SetLimit(limit64)
+
+	cursor, err := coll.Find(ctx, bson.M{}, findOpts)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "Failed to query MongoDB",
+			"details": err.Error(),
+		})
+		return
+	}
+	defer cursor.Close(ctx)
+
+	var results []ConcallLite
+	if err := cursor.All(ctx, &results); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "Failed to decode documents",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	// Get total count for pagination
+	totalCount, err := coll.CountDocuments(ctx, bson.M{})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "Failed to count documents",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	totalPages := (totalCount + int64(limit) - 1) / int64(limit)
+
+	c.JSON(http.StatusOK, gin.H{
+		"meta": gin.H{
+			"page":       page,
+			"limit":      limit,
+			"total":      totalCount,
+			"totalPages": totalPages,
+		},
+		"data": results,
+	})
+}
+
+func (cf *concallFetcher) FindConcallHandler(c *gin.Context) {
+	// Read and sanitize input
+	rawName := c.Query("name")
+	if strings.TrimSpace(rawName) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "query parameter 'name' is required"})
+		return
+	}
+	// Replace + (some clients may send + for spaces), trim spaces
+	name := strings.TrimSpace(strings.ReplaceAll(rawName, "+", " "))
+
+	// Pagination params (optional)
+	pageStr := c.DefaultQuery("page", "1")
+	limitStr := c.DefaultQuery("limit", "10")
+	page, err := strconv.Atoi(pageStr)
+	if err != nil || page <= 0 {
+		page = 1
+	}
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil || limit <= 0 {
+		limit = 10
+	}
+	skip := int64((page - 1) * limit)
+	limit64 := int64(limit)
+
+	// Build context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	coll := cf.db.Collection("guidances")
+
+	// Use regexp.QuoteMeta to escape any regex metacharacters the user may send.
+	// We do a substring match (no ^ or $ anchors) and add case-insensitive option.
+	escaped := regexp.QuoteMeta(name)
+	// The regex value is the escaped string; we set options "i" for case-insensitive
+	filter := bson.M{
+		"name": bson.M{
+			"$regex":   escaped,
+			"$options": "i",
+		},
+	}
+
+	// Projection: only return the fields we care about
+	projection := bson.M{
+		"name":     1,
+		"date":     1,
+		"guidance": 1,
+		"_id":      0,
+	}
+
+	findOpts := options.Find().
+		SetProjection(projection).
+		SetSort(bson.D{{Key: "date", Value: -1}}).
+		SetSkip(skip).
+		SetLimit(limit64)
+
+	// Count total matching docs (for pagination meta)
+	totalCount, err := coll.CountDocuments(ctx, filter)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to count documents", "details": err.Error()})
+		return
+	}
+
+	cursor, err := coll.Find(ctx, filter, findOpts)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to query MongoDB", "details": err.Error()})
+		return
+	}
+	defer cursor.Close(ctx)
+
+	var results []ConcallLite
+	if err := cursor.All(ctx, &results); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to decode documents", "details": err.Error()})
+		return
+	}
+
+	totalPages := (totalCount + int64(limit) - 1) / int64(limit)
+
+	c.JSON(http.StatusOK, gin.H{
+		"meta": gin.H{
+			"query":      name,
+			"page":       page,
+			"limit":      limit,
+			"total":      totalCount,
+			"totalPages": totalPages,
+		},
+		"data": results,
+	})
+
 }

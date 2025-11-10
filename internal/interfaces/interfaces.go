@@ -6,4 +6,6 @@ import (
 
 type Usecase interface {
 	FetchConcallDataHandler(c *gin.Context)
+	ListConcallHandler(c *gin.Context)
+	FindConcallHandler(c *gin.Context)
 }
