@@ -4,19 +4,28 @@ import (
 	"concall-analyser/config"
 	"concall-analyser/internal/db"
 	"concall-analyser/internal/interfaces"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
-	"strconv"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/generative-ai-go/genai"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+	"google.golang.org/api/googleapi"
+	"google.golang.org/api/option"
 )
 
 type concallFetcher struct {
@@ -70,7 +79,7 @@ func NewHTTPClient() *HTTPClient {
 		TLSClientConfig:   &tls.Config{MinVersion: tls.VersionTLS12},
 		ForceAttemptHTTP2: false,
 		MaxIdleConns:      100,
-		IdleConnTimeout:   90 * time.Second,
+		IdleConnTimeout:   600 * time.Second,
 		DialContext: (&net.Dialer{
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
@@ -79,7 +88,7 @@ func NewHTTPClient() *HTTPClient {
 
 	return &HTTPClient{
 		Client: &http.Client{
-			Timeout:   60 * time.Second,
+			Timeout:   600 * time.Second,
 			Transport: tr,
 		},
 	}
@@ -89,142 +98,512 @@ func NewConcallFetcher(db *db.MongoDB, cfg *config.Config) interfaces.Usecase {
 	return &concallFetcher{db: db, cfg: cfg}
 }
 
+// ConcallSummary represents the processed concall data to be stored in MongoDB
+type ConcallSummary struct {
+	ID        primitive.ObjectID `bson:"_id,omitempty" json:"id,omitempty"`
+	Name      string             `bson:"name" json:"name"`
+	Date      string             `bson:"date" json:"date"`
+	Guidance  string             `bson:"guidance" json:"guidance"`
+	CreatedAt time.Time          `bson:"created_at" json:"created_at"`
+}
+
 func (cf *concallFetcher) FetchConcallDataHandler(c *gin.Context) {
-	// TODO: Implement FetchConcallData
-	if cf.cfg.APIKey == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "API key is required"})
-		return
-	}
-
-	if cf.cfg.BaseURL == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Base URL is required"})
-		return
-	}
-
-	if cf.cfg.DestDir == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Destination directory is required"})
-		return
-	}
-
-	if cf.cfg.MaxWorkers == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Maximum workers is required"})
-		return
-	}
 
 	// Create optimized HTTP client
 	httpClient := NewHTTPClient()
 	// Fetch announcements
 	announcements, err := fetchAnnouncements(httpClient, c)
 	if err != nil {
-		log.Fatalf("Failed to fetch announcements: %v", err)
+		log.Printf("Failed to fetch announcements: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to fetch announcements: %v", err)})
+		return
 	}
 
-	fmt.Printf("Found %d announcements\n", len(announcements))
-	if err := os.MkdirAll(cf.cfg.DestDir, 0755); err != nil {
-		log.Fatalf("Failed to create directory: %v", err)
+	log.Printf("📊 Found %d announcements from API", len(announcements))
+
+	// Check if we have any announcements
+	if len(announcements) == 0 {
+		log.Printf("⚠️ No announcements found for the given date range")
+		c.JSON(http.StatusOK, gin.H{
+			"message":   "No announcements found for the given date range",
+			"count":     0,
+			"summaries": []ConcallSummary{},
+		})
+		return
 	}
+	// 2️⃣ Filter out announcements that already exist in Mongo
+	coll := cf.db.Database.Collection("guidances")
+	ctx, cancel := context.WithTimeout(context.Background(), 6000*time.Second)
+	defer cancel()
+
+	filteredAnnouncements, err := filterNewAnnouncements(ctx, coll, announcements)
+	if err != nil {
+		log.Printf("❌ Failed to filter announcements: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to filter announcements: %v", err)})
+		return
+	}
+
+	log.Printf("🆕 %d new announcements to process (out of %d total)", len(filteredAnnouncements), len(announcements))
+
+	if len(filteredAnnouncements) == 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "All announcements already processed",
+			"count":   0,
+		})
+		return
+	}
+
+	// Count announcements with PDFs
+	pdfCount := 0
+	for _, a := range announcements {
+		if a.AttachmentName != "" {
+			pdfCount++
+		}
+	}
+	log.Printf("📄 Found %d announcements with PDFs out of %d total", pdfCount, len(announcements))
+
+	// Create destination directory
+	if err := os.MkdirAll(cf.cfg.DestDir, 0755); err != nil {
+		log.Printf("Failed to create directory: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to create directory: %v", err)})
+		return
+	}
+
+	// Set default MaxWorkers if not configured
+	maxWorkers := cf.cfg.MaxWorkers
+	if maxWorkers == 0 {
+		maxWorkers = 10 // Default to 10 workers
+		log.Printf("⚠️ MaxWorkers not set, using default: %d", maxWorkers)
+	}
+	log.Printf("🔧 Using %d concurrent workers", maxWorkers)
+
+	genaiClient, model, err := initializeGeminiClient(ctx, cf.cfg.APIKey)
+	if err != nil {
+		log.Printf("Failed to initialize Gemini client: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to initialize Gemini client: %v", err)})
+		return
+	}
+	defer genaiClient.Close()
+
+	log.Printf("🚀 Starting to process %d announcements...", len(announcements))
+	// Process announcements concurrently and get results
+	summaries := processAnnouncementsSequentially(ctx, httpClient, genaiClient, model, announcements, cf.cfg.DestDir)
+	log.Printf("✅ Finished processing. Got %d summaries", len(summaries))
+
+	// Store summaries in MongoDB
+	if len(summaries) > 0 {
+		if err := cf.saveSummariesToMongo(ctx, summaries); err != nil {
+			log.Printf("Failed to save summaries to MongoDB: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error":   fmt.Sprintf("Failed to save summaries to MongoDB: %v", err),
+				"summary": "Processed but failed to save",
+				"count":   len(summaries),
+			})
+			return
+		}
+	} else {
+		log.Printf("⚠️ No summaries to save (all announcements may have been skipped)")
+	}
+
+	// Return success response with summaries
 	c.JSON(http.StatusOK, gin.H{
-		"message":       "Announcements fetched successfully",
-		"count":         len(announcements),
-		"announcements": announcements,
+		"message":   "Announcements processed and saved successfully",
+		"count":     len(summaries),
+		"summaries": summaries,
 	})
 }
 
-// func fetchAnnouncements(client *HTTPClient, c *gin.Context) ([]Announcement, error) {
-// 	fromDate := c.Query("from")
-// 	toDate := c.Query("to")
+func filterNewAnnouncements(ctx context.Context, coll *mongo.Collection, announcements []Announcement) ([]Announcement, error) {
+	if len(announcements) == 0 {
+		return []Announcement{}, nil
+	}
 
-// 	// Default to today (UTC/local as per server clock)
-// 	if fromDate == "" {
-// 		fromDate = time.Now().Format("20060102")
-// 	}
-// 	if toDate == "" {
-// 		toDate = time.Now().Format("20060102")
-// 	}
+	// Collect all names
+	names := make([]string, 0, len(announcements))
+	for _, a := range announcements {
+		names = append(names, a.ShortLongName)
+	}
 
-// 	// Validate and normalize dates; swap if from > to
-// 	fd, err := time.Parse("20060102", fromDate)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("invalid 'from' date (want YYYYMMDD): %w", err)
-// 	}
-// 	td, err := time.Parse("20060102", toDate)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("invalid 'to' date (want YYYYMMDD): %w", err)
-// 	}
-// 	if fd.After(td) {
-// 		fd, td = td, fd
-// 		fromDate = fd.Format("20060102")
-// 		toDate = td.Format("20060102")
-// 	}
+	// Fetch existing documents by name
+	filter := bson.M{"name": bson.M{"$in": names}}
+	cursor, err := coll.Find(ctx, filter)
+	if err != nil {
+		return nil, fmt.Errorf("mongo find error: %w", err)
+	}
+	defer cursor.Close(ctx)
 
-// 	// Base URL with stable shape (dates will be replaced)
-// 	rawURL := "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?" +
-// 		"pageno=1&strCat=Company+Update&strPrevDate=20251018&strScrip=&strSearch=P&strToDate=20251018&strType=C&subcategory=Earnings+Call+Transcript"
+	existingNames := make(map[string]bool)
+	for cursor.Next(ctx) {
+		var doc struct {
+			Name string `bson:"name"`
+		}
+		if err := cursor.Decode(&doc); err == nil {
+			existingNames[doc.Name] = true
+		}
+	}
 
-// 	parsedURL, err := url.Parse(rawURL)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("invalid base URL: %w", err)
-// 	}
+	// Filter out announcements that already exist
+	filtered := make([]Announcement, 0, len(announcements))
+	for _, a := range announcements {
+		if !existingNames[a.ShortLongName] {
+			filtered = append(filtered, a)
+		} else {
+			log.Printf("🗑️ Skipping existing announcement: %s", a.ShortLongName)
+		}
+	}
 
-// 	// Modify only date parameters
-// 	q := parsedURL.Query()
-// 	q.Set("strPrevDate", fromDate)
-// 	q.Set("strToDate", toDate)
-// 	parsedURL.RawQuery = q.Encode()
+	return filtered, nil
+}
 
-// 	finalURL := parsedURL.String() // avoid shadowing net/url
+// saveSummariesToMongo stores the concall summaries in MongoDB
+func (cf *concallFetcher) saveSummariesToMongo(ctx context.Context, summaries []ConcallSummary) error {
+	if cf.db == nil {
+		return fmt.Errorf("MongoDB database is not initialized")
+	}
 
-// 	// Use request context from Gin so it cancels on client disconnect/timeouts
-// 	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, finalURL, nil)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to create request: %w", err)
-// 	}
+	collection := cf.db.Collection("guidances")
 
-// 	// Headers to look like a browser (optional to keep)
-// 	req.Header.Set("Accept", "application/json, text/plain, */*")
-// 	req.Header.Set("Referer", "https://www.bseindia.com/")
-// 	req.Header.Set("User-Agent", "Mozilla/5.0")
-// 	req.Header.Set("Sec-CH-UA", `"Google Chrome";v="141", "Not?A_Brand";v="8", "Chromium";v="141"`)
-// 	req.Header.Set("Sec-CH-UA-Mobile", "?0")
-// 	req.Header.Set("Sec-CH-UA-Platform", `"macOS"`)
+	// Convert summaries to interface slice for bulk insert
+	docs := make([]interface{}, len(summaries))
+	for i, summary := range summaries {
+		docs[i] = summary
+	}
 
-// 	resp, err := client.Do(req)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to fetch announcements: %w", err)
-// 	}
-// 	defer resp.Body.Close()
+	// Use InsertMany for bulk insert
+	result, err := collection.InsertMany(ctx, docs)
+	if err != nil {
+		return fmt.Errorf("failed to insert summaries: %w", err)
+	}
 
-// 	if resp.StatusCode != http.StatusOK {
-// 		return nil, fmt.Errorf("BSE API returned status %d", resp.StatusCode)
-// 	}
+	log.Printf("✅ Successfully inserted %d summaries to MongoDB", len(result.InsertedIDs))
+	return nil
+}
 
-// 	body, err := io.ReadAll(resp.Body)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to read response body: %w", err)
-// 	}
+func processAnnouncementsSequentially(
+	ctx context.Context,
+	httpClient *HTTPClient,
+	genaiClient *genai.Client,
+	model *genai.GenerativeModel,
+	announcements []Announcement,
+	destDir string,
+) []ConcallSummary {
 
-// 	var annResp AnnouncementResponse
-// 	if err := json.Unmarshal(body, &annResp); err != nil {
-// 		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
-// 	}
+	results := make([]ConcallSummary, 0)
+	skippedCount := 0
+	errorCount := 0
 
-// 	// Normalize nil to empty slice
-// 	if annResp.Table == nil {
-// 		return []Announcement{}, nil
-// 	}
-// 	return annResp.Table, nil
-// }
+	log.Printf("⚙️ Starting sequential processing of %d announcements...", len(announcements))
+
+	for i, a := range announcements {
+		log.Printf("🔹 [%d/%d] Processing: %s", i+1, len(announcements), a.ShortLongName)
+
+		summary, err := processAnnouncement(ctx, httpClient, genaiClient, model, a, destDir)
+		if err != nil {
+			log.Printf("❌ Error processing announcement %s (PDFFlag: %d, Attachment: %s): %v",
+				a.ShortLongName, a.PDFFlag, a.AttachmentName, err)
+			errorCount++
+			continue
+		}
+
+		// Only add to results if summary is valid (not nil)
+		if summary != nil {
+			results = append(results, *summary)
+			log.Printf("✅ Processed successfully: %s", a.ShortLongName)
+		} else {
+			skippedCount++
+			log.Printf("⏭️ Skipped announcement: %s (PDFFlag: %d, Attachment: %s)",
+				a.ShortLongName, a.PDFFlag, a.AttachmentName)
+		}
+
+		// Optional delay between each call (e.g., 10 seconds)
+		time.Sleep(2 * time.Second)
+	}
+
+	log.Printf("📈 Processing complete - Success: %d, Skipped: %d, Errors: %d",
+		len(results), skippedCount, errorCount)
+
+	return results
+}
+
+func processAnnouncement(ctx context.Context, client *HTTPClient, genaiClient *genai.Client, model *genai.GenerativeModel, a Announcement, destDir string) (*ConcallSummary, error) {
+	// Only download if PDF exists
+	if a.AttachmentName == "" {
+		log.Printf("⏭️ Skipping announcement  AttachmentName='%s'", a.ShortLongName)
+		return nil, nil // Return nil to skip, not an error
+	}
+
+	datePart := strings.Split(a.NewsDate, "T")[0]
+	companyPart := sanitizeFileName(a.ShortLongName)
+	saveAs := fmt.Sprintf("%s_%s.pdf", companyPart, datePart)
+
+	log.Printf("📥 Downloading PDF: %s (from %s)", saveAs, a.AttachmentName)
+	path, err := downloadPDF(client, a.AttachmentName, destDir, saveAs)
+	if err != nil {
+		return nil, fmt.Errorf("download error for %s: %w", saveAs, err)
+	}
+
+	// Check if file exists and is not empty
+	fileInfo, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("file stat error for %s: %w", path, err)
+	}
+	if fileInfo.Size() == 0 {
+		return nil, fmt.Errorf("PDF file is empty at %s", path)
+	}
+
+	log.Printf("✅ PDF saved to %s (size: %d bytes)", path, fileInfo.Size())
+
+	// Ensure local temp file is cleaned up after processing
+	defer func() {
+		if err := os.Remove(path); err != nil {
+			log.Printf("⚠️ Warning: failed to remove temp file %s: %v", path, err)
+		}
+	}()
+
+	// Upload and summarize with Gemini
+	log.Printf("🤖 Uploading and summarizing PDF: %s", saveAs)
+	summary, err := summarizePDFWithGemini(ctx, genaiClient, model, path, saveAs)
+	if err != nil {
+		return nil, fmt.Errorf("summarization error for %s: %w", saveAs, err)
+	}
+
+	log.Printf("✅ Summary generated for %s:", saveAs)
+
+	// Create and return ConcallSummary struct
+	concallSummary := &ConcallSummary{
+		ID:        primitive.NewObjectID(),
+		Name:      a.ShortLongName,
+		Date:      datePart,
+		Guidance:  summary,
+		CreatedAt: time.Now(),
+	}
+
+	return concallSummary, nil
+}
+
+func sanitizeFileName(name string) string {
+	name = strings.ReplaceAll(name, " ", "_")
+	name = strings.ReplaceAll(name, "/", "_")
+	name = strings.ReplaceAll(name, "\\", "_")
+	name = strings.ReplaceAll(name, ":", "-")
+	return name
+}
+
+func downloadPDF(client *HTTPClient, attachmentName, destDir, saveAs string) (string, error) {
+	if attachmentName == "" {
+		return "", fmt.Errorf("attachment name is empty")
+	}
+
+	baseURL := "https://www.bseindia.com/xml-data/corpfiling/AttachLive/"
+	fullURL := baseURL + attachmentName
+
+	req, err := http.NewRequest("GET", fullURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
+	req.Header.Set("Referer", "https://www.bseindia.com/")
+	req.Header.Set("Accept", "application/pdf")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to download PDF: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("failed to download %s, status %d", attachmentName, resp.StatusCode)
+	}
+
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create directory: %w", err)
+	}
+
+	filePath := filepath.Join(destDir, saveAs)
+	out, err := os.Create(filePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to create file: %w", err)
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to write file: %w", err)
+	}
+
+	return filePath, nil
+}
+
+func makeGeminiCallWithRetry(ctx context.Context, model *genai.GenerativeModel, file *genai.File, prompt string) (*genai.GenerateContentResponse, error) {
+	const maxRetries = 5
+	baseDelay := 100 * time.Millisecond
+
+	for i := 0; i < maxRetries; i++ {
+		resp, err := model.GenerateContent(ctx,
+			genai.FileData{MIMEType: file.MIMEType, URI: file.URI},
+			genai.Text(prompt),
+		)
+
+		if err == nil {
+			return resp, nil // Success
+		}
+
+		// Check if the error is one we should retry (e.g., rate limit)
+		if !isRetriableError(err) {
+			return nil, fmt.Errorf("Gemini generation failed with non-retriable error: %w", err)
+		}
+
+		// Calculate exponential backoff delay with jitter
+		// Formula: baseDelay * 2^i + jitter
+		// time.Duration(1<<i) is equivalent to 2^i
+		delay := baseDelay * time.Duration(1<<i)
+		// Add some random jitter (up to 20% of the delay) to prevent thundering herd problem
+		jitter := time.Duration(rand.Int63n(int64(delay) / 5))
+		sleepTime := delay + jitter
+
+		log.Printf("⚠️ Rate limit or transient error detected. Retrying in %v (Attempt %d/%d). Error: %v", sleepTime, i+1, maxRetries, err)
+
+		// Wait for the calculated backoff time
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err() // Context canceled before retry
+		case <-time.After(sleepTime):
+			// Continue to the next loop iteration to retry
+		}
+	}
+
+	return nil, fmt.Errorf("Gemini generation failed after %d retries due to rate limits/transient errors", maxRetries)
+}
+func isRetriableError(err error) bool {
+	if apiErr, ok := err.(*googleapi.Error); ok {
+		// HTTP 429 Too Many Requests (Rate Limit)
+		// HTTP 500 Internal Server Error (Transient backend issue)
+		// HTTP 503 Service Unavailable (Transient backend issue)
+		return apiErr.Code == 429 || apiErr.Code == 500 || apiErr.Code == 503
+	}
+	// Default to not retriable if not a Google API error
+	return false
+}
+func summarizePDFWithGemini(ctx context.Context, client *genai.Client, model *genai.GenerativeModel, pdfPath, saveAs string) (string, error) {
+	// Upload file using the optimized method
+	file, err := client.UploadFileFromPath(ctx, pdfPath, &genai.UploadFileOptions{
+		MIMEType: "application/pdf",
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to upload PDF: %w", err)
+	}
+
+	fmt.Printf("✅ Uploaded file: %s (MIME: %s)\n", file.Name, file.MIMEType)
+
+	prompt := `Go through the concall and identify if management has given any guidance for fy26 on the future growth of the company in terms of revenue, earnings, eps etc. If yes, then just return the fy26' guidance after quantifying it and return nothing else. If no guidance is provided, then return "NA". Your responsse should be just 1 line providing the guidance for fy26' in numbers otherwise NA.`
+	resp, err := makeGeminiCallWithRetry(ctx, model, file, prompt)
+	// resp, err := model.GenerateContent(ctx,
+	// 	genai.FileData{
+	// 		MIMEType: file.MIMEType,
+	// 		URI:      file.URI,
+	// 	},
+	// 	genai.Text(prompt),
+	// )
+	if err != nil {
+		return "", fmt.Errorf("Gemini generation failed: %w", err)
+	}
+
+	if len(resp.Candidates) == 0 {
+		return "(no response)", nil
+	}
+
+	var output strings.Builder
+	for _, cand := range resp.Candidates {
+		for _, part := range cand.Content.Parts {
+			output.WriteString(fmt.Sprintln(part))
+		}
+	}
+
+	// Clean up uploaded file
+	if err := client.DeleteFile(ctx, file.Name); err != nil {
+		log.Printf("Warning: failed to delete uploaded file %s: %v", file.Name, err)
+	}
+
+	return strings.TrimSpace(output.String()), nil
+}
+
+func initializeGeminiClient(ctx context.Context, apiKey string) (*genai.Client, *genai.GenerativeModel, error) {
+	genaiClient, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create Gemini client: %w", err)
+	}
+
+	model := genaiClient.GenerativeModel("gemini-2.5-flash")
+	return genaiClient, model, nil
+}
+
+// parseHumanReadableDate parses a human-readable date string into time.Time
+// Supports multiple formats: "2025-10-18", "18-10-2025", "10/18/2025", "20251018"
+func parseHumanReadableDate(dateStr string) (time.Time, error) {
+	// Common date formats to try
+	formats := []string{
+		"2006-01-02",      // ISO format: 2025-10-18
+		"02-01-2006",      // DD-MM-YYYY: 18-10-2025
+		"01/02/2006",      // MM/DD/YYYY: 10/18/2025
+		"02/01/2006",      // DD/MM/YYYY: 18/10/2025
+		"20060102",        // YYYYMMDD: 20251018 (existing format)
+		"2006-1-2",        // ISO format without leading zeros
+		"2-1-2006",        // DD-MM-YYYY without leading zeros
+		"January 2, 2006", // "October 18, 2025"
+		"2 January 2006",  // "18 October 2025"
+		time.RFC3339,      // "2006-01-02T15:04:05Z07:00"
+		time.RFC3339Nano,  // "2006-01-02T15:04:05.999999999Z07:00"
+	}
+
+	// Try each format
+	for _, format := range formats {
+		if t, err := time.Parse(format, dateStr); err == nil {
+			return t, nil
+		}
+	}
+
+	// If all formats fail, return error
+	return time.Time{}, fmt.Errorf("unable to parse date '%s'. Supported formats: YYYY-MM-DD, DD-MM-YYYY, MM/DD/YYYY, DD/MM/YYYY, YYYYMMDD", dateStr)
+}
 
 // Fetch all pages between fromDate and toDate, accumulating results.
 func fetchAnnouncements(client *HTTPClient, c *gin.Context) ([]Announcement, error) {
-	fromDate := c.Query("from")
-	toDate := c.Query("to")
-	if fromDate == "" {
-		fromDate = time.Now().Format("20060102")
+	fromDateStr := c.Query("from")
+	toDateStr := c.Query("to")
+
+	var fromDate, toDate time.Time
+	var err error
+
+	// Parse fromDate
+	if fromDateStr == "" {
+		fromDate = time.Now()
+	} else {
+		fromDate, err = parseHumanReadableDate(fromDateStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid 'from' date: %w", err)
+		}
 	}
-	if toDate == "" {
-		toDate = time.Now().Format("20060102")
+
+	// Parse toDate
+	if toDateStr == "" {
+		toDate = time.Now()
+	} else {
+		toDate, err = parseHumanReadableDate(toDateStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid 'to' date: %w", err)
+		}
 	}
+
+	// Validate date range (fromDate should not be after toDate)
+	if fromDate.After(toDate) {
+		return nil, fmt.Errorf("'from' date (%s) cannot be after 'to' date (%s)",
+			fromDate.Format("2006-01-02"), toDate.Format("2006-01-02"))
+	}
+
+	// Format dates as YYYYMMDD for the API
+	fromDateFormatted := fromDate.Format("20060102")
+	toDateFormatted := toDate.Format("20060102")
 
 	baseURL := "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w" +
 		"?pageno=1&strCat=Company+Update&strPrevDate=20251018&strScrip=&strSearch=P" +
@@ -236,72 +615,51 @@ func fetchAnnouncements(client *HTTPClient, c *gin.Context) ([]Announcement, err
 	}
 
 	q := u.Query()
-	q.Set("strPrevDate", fromDate)
-	q.Set("strToDate", toDate)
+	q.Set("strPrevDate", fromDateFormatted)
+	q.Set("strToDate", toDateFormatted)
+	q.Set("pageno", "1") // Fetch only page 1
 	u.RawQuery = q.Encode()
 
-	const maxPages = 200 // safety guard; tune if needed
-	all := make([]Announcement, 0, 256)
+	// Make request for page 1
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json, text/plain, */*")
+	req.Header.Set("Referer", "https://www.bseindia.com/")
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Header.Set("Sec-CH-UA", `"Google Chrome";v="141", "Not?A_Brand";v="8", "Chromium";v="141"`)
+	req.Header.Set("Sec-CH-UA-Mobile", "?0")
+	req.Header.Set("Sec-CH-UA-Platform", `"macOS"`)
 
-	for page := 1; page <= maxPages; page++ {
-		// set current page
-		q := u.Query()
-		q.Set("pageno", strconv.Itoa(page))
-		u.RawQuery = q.Encode()
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch announcements: %w", err)
+	}
+	defer resp.Body.Close()
 
-		// GET page
-		req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, u.String(), nil)
-		if err != nil {
-			return nil, fmt.Errorf("create request: %w", err)
-		}
-		req.Header.Set("Accept", "application/json, text/plain, */*")
-		req.Header.Set("Referer", "https://www.bseindia.com/")
-		req.Header.Set("User-Agent", "Mozilla/5.0")
-		req.Header.Set("Sec-CH-UA", `"Google Chrome";v="141", "Not?A_Brand";v="8", "Chromium";v="141"`)
-		req.Header.Set("Sec-CH-UA-Mobile", "?0")
-		req.Header.Set("Sec-CH-UA-Platform", `"macOS"`)
-		resp, err := client.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("fetch page %d: %w", page, err)
-		}
-		func() {
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				err = fmt.Errorf("BSE API status %d on page %d", resp.StatusCode, page)
-				return
-			}
-			body, e := io.ReadAll(resp.Body)
-			if e != nil {
-				err = fmt.Errorf("read body page %d: %w", page, e)
-				return
-			}
-
-			var ar AnnouncementResponse
-			if e := json.Unmarshal(body, &ar); e != nil {
-				err = fmt.Errorf("unmarshal page %d: %w", page, e)
-				return
-			}
-
-			rows := ar.Table
-			// Stop condition: empty page
-			if len(rows) == 0 {
-				// no more pages
-				return
-			}
-
-			all = append(all, rows...)
-		}()
-		if err != nil {
-			return nil, err
-		}
-
-		// Optional: be polite if they rate-limit
-		time.Sleep(150 * time.Millisecond)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("BSE API returned status %d", resp.StatusCode)
 	}
 
-	// Optional: de-duplicate if the API can return overlaps
-	// (e.g., by NewsID field if available)
-	// all = dedupeAnnouncements(all)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
 
-	return all, nil
+	var ar AnnouncementResponse
+	if err := json.Unmarshal(body, &ar); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	// Return the announcements from the first page
+	return ar.Table, nil
+}
+
+// Helper function for min (if not using Go 1.21+)
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

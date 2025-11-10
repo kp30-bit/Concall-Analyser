@@ -73,6 +73,10 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("missing required configuration for %s environment", cfg.Env)
 	}
 
+	if cfg.MaxWorkers == 0 {
+		cfg.MaxWorkers = 20
+	}
+
 	// Log safe info only
 	log.Printf("📦 Loaded Config: Env=%s, Port=%s, DB=%s", cfg.Env, cfg.Port, cfg.MongoDBName)
 
