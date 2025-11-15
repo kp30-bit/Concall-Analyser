@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -60,14 +61,52 @@ func NewApp() *App {
 	usecase := usecase.NewConcallFetcher(db, cfg)
 	router := gin.Default()
 
-	// Register routes
+	// Enable CORS for API routes
+	router.Use(corsMiddleware())
+
+	// Register API routes (prefixed with /api)
 	controller.RegisterRoutes(router, usecase)
+
+	// Serve static frontend assets (JS, CSS, images, etc.)
+	router.Static("/static", "./frontend/build/static")
+
+	// Serve other static files (favicon, manifest, etc.)
+	router.StaticFile("/favicon.ico", "./frontend/build/favicon.ico")
+	router.StaticFile("/manifest.json", "./frontend/build/manifest.json")
+	router.StaticFile("/robots.txt", "./frontend/build/robots.txt")
+
+	// Serve React app for all non-API routes (SPA routing)
+	router.NoRoute(func(c *gin.Context) {
+		// Don't serve index.html for API routes
+		if strings.HasPrefix(c.Request.URL.Path, "/api") {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Not found"})
+			return
+		}
+		c.File("./frontend/build/index.html")
+	})
 
 	return &App{
 		Router:      router,
 		Usecase:     usecase,
 		MongoClient: client,
 		Config:      cfg,
+	}
+}
+
+// CORS middleware
+func corsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With")
+		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE, PATCH")
+
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(204)
+			return
+		}
+
+		c.Next()
 	}
 }
 

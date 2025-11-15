@@ -7,8 +7,11 @@ import (
 )
 
 func RegisterRoutes(r *gin.Engine, u interfaces.Usecase) {
-
-	r.GET("/fetch_concalls", u.FetchConcallDataHandler)
-	r.GET("/list_concalls", u.ListConcallHandler)
-	r.GET("/find_concalls", u.FindConcallHandler)
+	// Prefix all API routes with /api
+	api := r.Group("/api")
+	{
+		api.GET("/fetch_concalls", u.FetchConcallDataHandler)
+		api.GET("/list_concalls", u.ListConcallHandler)
+		api.GET("/find_concalls", u.FindConcallHandler)
+	}
 }

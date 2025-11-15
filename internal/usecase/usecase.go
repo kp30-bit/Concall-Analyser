@@ -3,6 +3,7 @@ package usecase
 import (
 	"concall-analyser/config"
 	"concall-analyser/internal/db"
+	"concall-analyser/internal/domain"
 	"concall-analyser/internal/interfaces"
 	"context"
 	"crypto/tls"
@@ -40,58 +41,21 @@ type HTTPClient struct {
 	*http.Client
 }
 
-type AnnouncementResponse struct {
-	Table  []Announcement `json:"Table"`
-	Table1 []struct {
-		ROWCNT int `json:"ROWCNT"`
-	} `json:"Table1"`
-}
-type Announcement struct {
-	NewsID           string  `json:"NEWSID"`
-	ScripCode        int     `json:"SCRIP_CD"`
-	XMLName          string  `json:"XML_NAME"`
-	NewsSubject      string  `json:"NEWSSUB"`
-	Datetime         string  `json:"DT_TM"`
-	NewsDate         string  `json:"NEWS_DT"`
-	NewsSubmission   string  `json:"News_submission_dt"`
-	DisseminationDT  string  `json:"DissemDT"`
-	CriticalNews     int     `json:"CRITICALNEWS"`
-	AnnouncementType string  `json:"ANNOUNCEMENT_TYPE"`
-	QuarterID        *string `json:"QUARTER_ID"`
-	FileStatus       string  `json:"FILESTATUS"`
-	AttachmentName   string  `json:"ATTACHMENTNAME"`
-	More             string  `json:"MORE"`
-	Headline         string  `json:"HEADLINE"`
-	CategoryName     string  `json:"CATEGORYNAME"`
-	Old              int     `json:"OLD"`
-	RN               int     `json:"RN"`
-	PDFFlag          int     `json:"PDFFLAG"`
-	NSURL            string  `json:"NSURL"`
-	ShortLongName    string  `json:"SLONGNAME"`
-	AgendaID         int     `json:"AGENDA_ID"`
-	TotalPageCount   int     `json:"TotalPageCnt"`
-	TimeDiff         string  `json:"TimeDiff"`
-	FileAttachSize   int64   `json:"Fld_Attachsize"`
-	SubCategoryName  string  `json:"SUBCATNAME"`
-	AudioVideoFile   *string `json:"AUDIO_VIDEO_FILE"`
-}
-
-// NewHTTPClient creates an optimized HTTP client
 func NewHTTPClient() *HTTPClient {
 	tr := &http.Transport{
 		TLSClientConfig:   &tls.Config{MinVersion: tls.VersionTLS12},
 		ForceAttemptHTTP2: false,
 		MaxIdleConns:      100,
-		IdleConnTimeout:   600 * time.Second,
+		IdleConnTimeout:   3600 * time.Second,
 		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
+			Timeout:   3600 * time.Second,
+			KeepAlive: 3600 * time.Second,
 		}).DialContext,
 	}
 
 	return &HTTPClient{
 		Client: &http.Client{
-			Timeout:   600 * time.Second,
+			Timeout:   3600 * time.Second,
 			Transport: tr,
 		},
 	}
@@ -99,15 +63,6 @@ func NewHTTPClient() *HTTPClient {
 
 func NewConcallFetcher(db *db.MongoDB, cfg *config.Config) interfaces.Usecase {
 	return &concallFetcher{db: db, cfg: cfg}
-}
-
-// ConcallSummary represents the processed concall data to be stored in MongoDB
-type ConcallSummary struct {
-	ID        primitive.ObjectID `bson:"_id,omitempty" json:"id,omitempty"`
-	Name      string             `bson:"name" json:"name"`
-	Date      string             `bson:"date" json:"date"`
-	Guidance  string             `bson:"guidance" json:"guidance"`
-	CreatedAt time.Time          `bson:"created_at" json:"created_at"`
 }
 
 func (cf *concallFetcher) FetchConcallDataHandler(c *gin.Context) {
@@ -130,13 +85,13 @@ func (cf *concallFetcher) FetchConcallDataHandler(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"message":   "No announcements found for the given date range",
 			"count":     0,
-			"summaries": []ConcallSummary{},
+			"summaries": []domain.ConcallSummary{},
 		})
 		return
 	}
 	// 2️⃣ Filter out announcements that already exist in Mongo
 	coll := cf.db.Database.Collection("guidances")
-	ctx, cancel := context.WithTimeout(context.Background(), 6000*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3600*time.Second)
 	defer cancel()
 
 	filteredAnnouncements, err := filterNewAnnouncements(ctx, coll, announcements)
@@ -216,9 +171,9 @@ func (cf *concallFetcher) FetchConcallDataHandler(c *gin.Context) {
 	})
 }
 
-func filterNewAnnouncements(ctx context.Context, coll *mongo.Collection, announcements []Announcement) ([]Announcement, error) {
+func filterNewAnnouncements(ctx context.Context, coll *mongo.Collection, announcements []domain.Announcement) ([]domain.Announcement, error) {
 	if len(announcements) == 0 {
-		return []Announcement{}, nil
+		return []domain.Announcement{}, nil
 	}
 
 	// Collect all names
@@ -246,7 +201,7 @@ func filterNewAnnouncements(ctx context.Context, coll *mongo.Collection, announc
 	}
 
 	// Filter out announcements that already exist
-	filtered := make([]Announcement, 0, len(announcements))
+	filtered := make([]domain.Announcement, 0, len(announcements))
 	for _, a := range announcements {
 		if !existingNames[a.ShortLongName] {
 			filtered = append(filtered, a)
@@ -259,7 +214,7 @@ func filterNewAnnouncements(ctx context.Context, coll *mongo.Collection, announc
 }
 
 // saveSummariesToMongo stores the concall summaries in MongoDB
-func (cf *concallFetcher) saveSummariesToMongo(ctx context.Context, summaries []ConcallSummary) error {
+func (cf *concallFetcher) saveSummariesToMongo(ctx context.Context, summaries []domain.ConcallSummary) error {
 	if cf.db == nil {
 		return fmt.Errorf("MongoDB database is not initialized")
 	}
@@ -287,11 +242,11 @@ func processAnnouncementsSequentially(
 	httpClient *HTTPClient,
 	genaiClient *genai.Client,
 	model *genai.GenerativeModel,
-	announcements []Announcement,
+	announcements []domain.Announcement,
 	destDir string,
-) []ConcallSummary {
+) []domain.ConcallSummary {
 
-	results := make([]ConcallSummary, 0)
+	results := make([]domain.ConcallSummary, 0)
 	skippedCount := 0
 	errorCount := 0
 
@@ -319,7 +274,7 @@ func processAnnouncementsSequentially(
 		}
 
 		// Optional delay between each call (e.g., 10 seconds)
-		time.Sleep(2 * time.Second)
+		time.Sleep(1 * time.Second)
 	}
 
 	log.Printf("📈 Processing complete - Success: %d, Skipped: %d, Errors: %d",
@@ -328,7 +283,7 @@ func processAnnouncementsSequentially(
 	return results
 }
 
-func processAnnouncement(ctx context.Context, client *HTTPClient, genaiClient *genai.Client, model *genai.GenerativeModel, a Announcement, destDir string) (*ConcallSummary, error) {
+func processAnnouncement(ctx context.Context, client *HTTPClient, genaiClient *genai.Client, model *genai.GenerativeModel, a domain.Announcement, destDir string) (*domain.ConcallSummary, error) {
 	// Only download if PDF exists
 	if a.AttachmentName == "" {
 		log.Printf("⏭️ Skipping announcement  AttachmentName='%s'", a.ShortLongName)
@@ -373,7 +328,7 @@ func processAnnouncement(ctx context.Context, client *HTTPClient, genaiClient *g
 	log.Printf("✅ Summary generated for %s:", saveAs)
 
 	// Create and return ConcallSummary struct
-	concallSummary := &ConcallSummary{
+	concallSummary := &domain.ConcallSummary{
 		ID:        primitive.NewObjectID(),
 		Name:      a.ShortLongName,
 		Date:      datePart,
@@ -571,7 +526,7 @@ func parseHumanReadableDate(dateStr string) (time.Time, error) {
 }
 
 // Fetch all pages between fromDate and toDate, accumulating results.
-func fetchAnnouncements(client *HTTPClient, c *gin.Context) ([]Announcement, error) {
+func fetchAnnouncements(client *HTTPClient, c *gin.Context) ([]domain.Announcement, error) {
 	fromDateStr := c.Query("from")
 	toDateStr := c.Query("to")
 
@@ -650,7 +605,7 @@ func fetchAnnouncements(client *HTTPClient, c *gin.Context) ([]Announcement, err
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	var ar AnnouncementResponse
+	var ar domain.AnnouncementResponse
 	if err := json.Unmarshal(body, &ar); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
 	}
@@ -661,14 +616,8 @@ func fetchAnnouncements(client *HTTPClient, c *gin.Context) ([]Announcement, err
 
 // Helper function for min (if not using Go 1.21+)
 
-type ConcallLite struct {
-	Name     string `bson:"name" json:"name"`
-	Date     string `bson:"date" json:"date"`
-	Guidance string `bson:"guidance" json:"guidance"`
-}
-
 func (cf *concallFetcher) ListConcallHandler(c *gin.Context) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3600*time.Second)
 	defer cancel()
 
 	pageStr := c.DefaultQuery("page", "1")
@@ -712,7 +661,7 @@ func (cf *concallFetcher) ListConcallHandler(c *gin.Context) {
 	}
 	defer cursor.Close(ctx)
 
-	var results []ConcallLite
+	var results []domain.ConcallLite
 	if err := cursor.All(ctx, &results); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error":   "Failed to decode documents",
@@ -769,7 +718,7 @@ func (cf *concallFetcher) FindConcallHandler(c *gin.Context) {
 	limit64 := int64(limit)
 
 	// Build context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3600*time.Second)
 	defer cancel()
 
 	coll := cf.db.Collection("guidances")
@@ -813,7 +762,7 @@ func (cf *concallFetcher) FindConcallHandler(c *gin.Context) {
 	}
 	defer cursor.Close(ctx)
 
-	var results []ConcallLite
+	var results []domain.ConcallLite
 	if err := cursor.All(ctx, &results); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to decode documents", "details": err.Error()})
 		return
