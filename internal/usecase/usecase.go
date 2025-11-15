@@ -782,3 +782,124 @@ func (cf *concallFetcher) FindConcallHandler(c *gin.Context) {
 	})
 
 }
+
+func (cf *concallFetcher) CleanupConcallHandler(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3600*time.Second)
+	defer cancel()
+
+	coll := cf.db.Collection("guidances")
+
+	// Step 1: Delete all records with guidance == "NA"
+	naFilter := bson.M{"guidance": "NA"}
+	naResult, err := coll.DeleteMany(ctx, naFilter)
+	if err != nil {
+		log.Printf("❌ Failed to delete NA guidance records: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "Failed to delete NA guidance records",
+			"details": err.Error(),
+		})
+		return
+	}
+	naDeletedCount := naResult.DeletedCount
+	log.Printf("🗑️ Deleted %d records with guidance='NA'", naDeletedCount)
+
+	// Step 2: Find and delete duplicates based on name field
+	// We'll keep the most recent record (by created_at) for each name
+
+	// First, get all documents grouped by name
+	pipeline := []bson.M{
+		{
+			"$group": bson.M{
+				"_id": "$name",
+				"docs": bson.M{
+					"$push": "$$ROOT",
+				},
+				"count": bson.M{"$sum": 1},
+			},
+		},
+		{
+			"$match": bson.M{
+				"count": bson.M{"$gt": 1}, // Only groups with more than 1 document
+			},
+		},
+	}
+
+	cursor, err := coll.Aggregate(ctx, pipeline)
+	if err != nil {
+		log.Printf("❌ Failed to find duplicates: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "Failed to find duplicates",
+			"details": err.Error(),
+		})
+		return
+	}
+	defer cursor.Close(ctx)
+
+	type DuplicateGroup struct {
+		Name  string                  `bson:"_id"`
+		Docs  []domain.ConcallSummary `bson:"docs"`
+		Count int                     `bson:"count"`
+	}
+
+	var duplicateGroups []DuplicateGroup
+	if err := cursor.All(ctx, &duplicateGroups); err != nil {
+		log.Printf("❌ Failed to decode duplicate groups: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "Failed to decode duplicate groups",
+			"details": err.Error(),
+		})
+		return
+	}
+
+	duplicateDeletedCount := int64(0)
+	duplicateNamesProcessed := 0
+
+	// For each duplicate group, keep the most recent one and delete the rest
+	for _, group := range duplicateGroups {
+		if len(group.Docs) <= 1 {
+			continue
+		}
+
+		// Find the document with the most recent created_at
+		var keepID primitive.ObjectID
+		var latestTime time.Time
+
+		for _, doc := range group.Docs {
+			if doc.CreatedAt.After(latestTime) || latestTime.IsZero() {
+				latestTime = doc.CreatedAt
+				keepID = doc.ID
+			}
+		}
+
+		// Delete all documents with this name except the one we're keeping
+		deleteFilter := bson.M{
+			"name": group.Name,
+			"_id":  bson.M{"$ne": keepID},
+		}
+
+		deleteResult, err := coll.DeleteMany(ctx, deleteFilter)
+		if err != nil {
+			log.Printf("⚠️ Failed to delete duplicates for name '%s': %v", group.Name, err)
+			continue
+		}
+
+		duplicateDeletedCount += deleteResult.DeletedCount
+		duplicateNamesProcessed++
+		log.Printf("🗑️ Deleted %d duplicate(s) for name '%s' (kept most recent)", deleteResult.DeletedCount, group.Name)
+	}
+
+	totalDeleted := naDeletedCount + duplicateDeletedCount
+
+	log.Printf("✅ Cleanup complete - NA records deleted: %d, Duplicates deleted: %d, Total deleted: %d",
+		naDeletedCount, duplicateDeletedCount, totalDeleted)
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Cleanup completed successfully",
+		"summary": gin.H{
+			"naGuidanceDeleted":       naDeletedCount,
+			"duplicatesDeleted":       duplicateDeletedCount,
+			"duplicateNamesProcessed": duplicateNamesProcessed,
+			"totalDeleted":            totalDeleted,
+		},
+	})
+}
