@@ -3,18 +3,13 @@ package analytics
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"concall-analyser/internal/domain"
-
-	"github.com/google/uuid"
 )
 
 // AnalyticsService handles analytics business logic
 type AnalyticsService interface {
-	GetOrCreateSessionID(existingSessionID string) string
-	RecordPageView(ctx context.Context, sessionID, endpoint string) error
-	RecordAPICall(ctx context.Context, sessionID, endpoint string) error
+	IncrementTotalVisits(ctx context.Context) error
 	GetSummary(ctx context.Context) (*domain.AnalyticsSummary, error)
 }
 
@@ -29,44 +24,19 @@ func NewAnalyticsService(repo domain.AnalyticsRepository) AnalyticsService {
 	}
 }
 
-// GetOrCreateSessionID returns existing session ID or generates a new one
-func (s *analyticsService) GetOrCreateSessionID(existingSessionID string) string {
-	if existingSessionID != "" {
-		return existingSessionID
-	}
-	return uuid.New().String()
-}
-
-// RecordPageView records a page view event
-func (s *analyticsService) RecordPageView(ctx context.Context, sessionID, endpoint string) error {
-	event := &domain.AnalyticsEvent{
-		SessionID: sessionID,
-		Endpoint:  endpoint,
-		EventType: "page_view",
-		Timestamp: time.Now(),
-	}
-	
-	return s.repo.RecordEvent(ctx, event)
-}
-
-// RecordAPICall records an API call event
-func (s *analyticsService) RecordAPICall(ctx context.Context, sessionID, endpoint string) error {
-	event := &domain.AnalyticsEvent{
-		SessionID: sessionID,
-		Endpoint:  endpoint,
-		EventType: "api_call",
-		Timestamp: time.Now(),
-	}
-	
-	return s.repo.RecordEvent(ctx, event)
+// IncrementTotalVisits increments the total visits counter
+func (s *analyticsService) IncrementTotalVisits(ctx context.Context) error {
+	return s.repo.IncrementTotalVisits(ctx)
 }
 
 // GetSummary retrieves analytics summary
 func (s *analyticsService) GetSummary(ctx context.Context) (*domain.AnalyticsSummary, error) {
-	summary, err := s.repo.GetSummary(ctx)
+	totalVisits, err := s.repo.GetTotalVisits(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get analytics summary: %w", err)
+		return nil, fmt.Errorf("failed to get total visits: %w", err)
 	}
-	return summary, nil
-}
 
+	return &domain.AnalyticsSummary{
+		TotalVisits: totalVisits,
+	}, nil
+}

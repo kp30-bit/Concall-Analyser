@@ -134,24 +134,12 @@ function Analytics() {
 
   // Always render the dashboard, even if analytics is null (will show 0s)
   const analyticsData = analytics || {
-    total_visits: 0,
-    unique_users: 0,
-    api_hits: 0,
-    endpoint_stats: {}
+    total_visits: 0
   };
 
   return (
     <div className="analytics-container">
       <div className="analytics-grid">
-        <div className="analytics-card">
-          <div className="analytics-card-header">
-            <div className="analytics-card-icon">👥</div>
-            <div className="analytics-card-label">Unique Users</div>
-          </div>
-          <div className="analytics-card-value">
-            {analyticsData.unique_users?.toLocaleString() || 0}
-          </div>
-        </div>
         <div className="analytics-card">
           <div className="analytics-card-header">
             <div className="analytics-card-icon">🌐</div>
