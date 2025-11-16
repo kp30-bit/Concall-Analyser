@@ -21,9 +21,27 @@ export const searchConcalls = async (name, page = 1, limit = 12) => {
   return handleResponse(response);
 };
 
+// Prevent duplicate analytics requests within a short time window
+let lastAnalyticsCall = null;
+const ANALYTICS_CALL_COOLDOWN = 5000; // 5 seconds
+
 export const getAnalytics = async () => {
+  const now = Date.now();
+  
+  // If a call was made recently, return the cached promise
+  if (lastAnalyticsCall && (now - lastAnalyticsCall.timestamp) < ANALYTICS_CALL_COOLDOWN) {
+    return lastAnalyticsCall.promise;
+  }
+
   const url = `${API_BASE_URL}/analytics`;
-  const response = await fetch(url);
-  return handleResponse(response);
+  const promise = fetch(url).then(response => handleResponse(response));
+  
+  // Cache the promise and timestamp
+  lastAnalyticsCall = {
+    promise,
+    timestamp: now
+  };
+  
+  return promise;
 };
 

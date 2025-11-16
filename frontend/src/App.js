@@ -76,8 +76,8 @@ function App() {
     <div className="App">
       <div className="container">
         <header className="header">
-          <h1 className="title">📊 Concall Analyser</h1>
-          <p className="subtitle">Earnings Call Transcripts & Guidance</p>
+          <h1 className="title">Cipher</h1>
+          <p className="subtitle">Real-time guidance derived from every concall</p>
         </header>
 
         <SearchBar 

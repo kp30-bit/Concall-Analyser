@@ -53,7 +53,7 @@ func (g *geminiClient) SummarizePDF(ctx context.Context, pdfPath string) (string
 
 	fmt.Printf("✅ Uploaded file: %s (MIME: %s)\n", file.Name, file.MIMEType)
 
-	prompt := `Go through the concall and identify if management has given any guidance for fy26 on the future growth of the company in terms of revenue, earnings, eps etc. If yes, then just return the fy26' guidance after quantifying it and return nothing else. If no guidance is provided, then return "NA". Your responsse should be just 1 line providing the guidance for fy26' in numbers otherwise NA.`
+	prompt := `Go through the concall and identify if management has given any guidance for fy26 on the future growth of the company in terms of revenue, profit or eps. If yes, then quantify the guidance andjust return the fy26' guidance an nothing else. If no guidance is provided, then return "NA". Your responsse should be just 1 line providing the guidance for fy26' in numbers otherwise NA.`
 
 	resp, err := g.makeCallWithRetry(ctx, file, prompt)
 	if err != nil {
@@ -119,4 +119,3 @@ func isRetriableError(err error) bool {
 	}
 	return false
 }
-

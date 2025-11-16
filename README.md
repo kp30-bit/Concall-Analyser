@@ -81,7 +81,11 @@ Concall-Analyser/
 
 ## Improvements (Future)
 
-- Analytics -> Unique Users, Total Views (RENO - Kafka, WebSockets/SSE)
+- Real time Analytics -> Unique Users, Total Views (RENO - Kafka, WebSockets/SSE)
+- Remove multiple calls to analytics api. 
+- Optimise storing analytics to mongo
+- Add analytics on the top of the screen. 
+- Make UI compatible with 3ft device. 
 - Watchlist
 - Other Growth Triggers
 - Sorting & filtering
