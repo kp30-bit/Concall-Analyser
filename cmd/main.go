@@ -8,6 +8,7 @@ import (
 	"concall-analyser/internal/repository/mongo"
 	"concall-analyser/internal/service/analytics"
 	"concall-analyser/internal/usecase"
+	ws "concall-analyser/internal/websocket"
 	"context"
 	"log"
 	"net/http"
@@ -21,7 +22,6 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// Singletons
 var (
 	cfgInstance *config.Config
 	cfgOnce     sync.Once
@@ -30,7 +30,6 @@ var (
 	mongoOnce   sync.Once
 )
 
-// App struct
 type App struct {
 	Router      *gin.Engine
 	Usecase     interfaces.Usecase
@@ -51,7 +50,6 @@ func main() {
 		}
 	}()
 
-	// Graceful shutdown
 	gracefulShutdown(srv, mongoClient)
 
 }
@@ -61,9 +59,14 @@ func NewApp() *App {
 
 	client, db := GetMongo(cfg)
 
+	// Initialize WebSocket hub for real-time updates
+	hub := ws.NewHub()
+	go hub.Run()
+	log.Println("✅ WebSocket hub started")
+
 	// Initialize analytics service (shared between usecase and middleware)
 	analyticsRepo := mongo.NewAnalyticsRepository(db)
-	analyticsService := analytics.NewAnalyticsService(analyticsRepo)
+	analyticsService := analytics.NewAnalyticsService(analyticsRepo, hub)
 
 	usecaseInstance, err := usecase.NewConcallFetcher(db, cfg, analyticsService)
 	if err != nil {
@@ -74,10 +77,10 @@ func NewApp() *App {
 	// Enable CORS for API routes
 	router.Use(corsMiddleware())
 
-	// Register API routes (prefixed with /api)
-	controller.RegisterRoutes(router, usecaseInstance, analyticsService)
+	// Register API routes (prefixed with /api) and WebSocket endpoint
+	controller.RegisterRoutes(router, usecaseInstance, analyticsService, hub)
 
-	// Serve static frontend assets (JS, CSS, images, etc.)
+	// Serve static frontend assets
 	router.Static("/static", "./frontend/build/static")
 
 	// Serve other static files (favicon, manifest, etc.)
@@ -103,7 +106,6 @@ func NewApp() *App {
 	}
 }
 
-// CORS middleware
 func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
@@ -132,7 +134,6 @@ func GetConfig() *config.Config {
 	return cfgInstance
 }
 
-// GetMongo singleton
 func GetMongo(cfg *config.Config) (*db.MongoClient, *db.MongoDB) {
 	mongoOnce.Do(func() {
 
@@ -157,13 +158,11 @@ func gracefulShutdown(srv *http.Server, client *db.MongoClient) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3600*time.Second)
 	defer cancel()
 
-	// Shutdown HTTP server first
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Fatalf("❌ Server forced to shutdown: %v", err)
 	}
 	log.Println("✅ HTTP server stopped")
 
-	// Disconnect MongoDB
 	if err := client.Disconnect(ctx); err != nil {
 		log.Fatalf("❌ Error disconnecting MongoDB: %v", err)
 	}

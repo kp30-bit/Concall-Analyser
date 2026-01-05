@@ -1,8 +1,12 @@
 module concall-analyser
 
-go 1.25.2
+go 1.25
 
-require github.com/spf13/viper v1.21.0
+require (
+	github.com/gorilla/websocket v1.5.3
+	github.com/spf13/viper v1.21.0
+	google.golang.org/api v0.186.0
+)
 
 require (
 	cloud.google.com/go v0.115.0 // indirect
@@ -62,7 +66,6 @@ require (
 	golang.org/x/sync v0.16.0 // indirect
 	golang.org/x/time v0.5.0 // indirect
 	golang.org/x/tools v0.35.0 // indirect
-	google.golang.org/api v0.186.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20240617180043-68d350f18fd4 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240617180043-68d350f18fd4 // indirect
 	google.golang.org/grpc v1.64.1 // indirect
