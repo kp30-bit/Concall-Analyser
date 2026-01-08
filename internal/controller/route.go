@@ -20,6 +20,14 @@ var upgrader = websocket.Upgrader{
 func RegisterRoutes(r *gin.Engine, u interfaces.Usecase, analyticsService analytics.AnalyticsService, hub *ws.Hub) {
 	r.Use(middleware.AnalyticsMiddleware(analyticsService))
 
+	// Simple health check endpoint that does not touch the database.
+	// Useful for uptime pings (e.g., keeping Render free-tier dynos warm).
+	r.GET("/healthz", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"status": "ok",
+		})
+	})
+
 	r.GET("/ws/analytics", func(c *gin.Context) {
 		conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 		if err != nil {
